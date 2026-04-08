@@ -125,5 +125,5 @@ const projection = d3.geoConicConformal() // 兰勃特等角圆锥投影等
 1. **防止内存泄漏 (Memory Leaks)**：Vue 组件 (`Scene3D.vue`) 在被卸载或销毁时，必须调用 `threeApp.js` 提供的 `destroyScene()`，清除 WebGL 的 `renderer.dispose()` 和 `requestAnimationFrame`，否则频繁切换页面会导致系统卡顿甚至崩溃。
 2. **样式解耦**：组件内的特有样式必须增加 `scoped` 标签 (`<style scoped>`) 防止污染全局；全局排版的样式统一在 `App.vue` 底部或 `style.css` 中写。
 3. **环境清理**：开发期间由于权限限制可能生成的 `.cjs`, `.bak` 等注入验证脚本均属于废料，请勿将它们提交至 Git 远端仓库代码中。
-
+4. **上传注意事项** 克隆该项目在本地后请勿让AI修改目前已经存在的结构，功能完成之后请在本地确认好功能效果完好再Pull Request到main分支里
 > 预祝小组作业完成顺利！
