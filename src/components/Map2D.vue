@@ -2,8 +2,11 @@
   <div class="map2d-container">
     <div class="controls-panel">
       <div class="panel-header">
-        <h3>💡 2D 投影参数 (支持双向联动与精确修改)</h3>
-        <span class="badge">双向实时同步开启</span>
+        <h3>2D 投影参数控制</h3>
+        <div class="header-actions">
+          <button class="toggle-btn" :class="{ active: currentVariant === 'conformal' }" @click="setVariant('conformal')">等角投影</button>
+          <button class="toggle-btn" :class="{ active: currentVariant === 'equalArea' }" @click="setVariant('equalArea')">等面积投影</button>
+        </div>
       </div>
       
       <div class="sliders-grid">
@@ -22,9 +25,9 @@
         </div>
 
         <div class="param-item">
-          <label>旋转角 (Roll)</label>
-          <input type="range" min="-180" max="180" v-model.number="roll" @input="updateLocalMap" />
-          <input type="number" class="value-input" v-model.number="roll" @change="updateLocalMap" />
+          <label>不变形线纬度 (Secant Lat)</label>
+          <input type="range" min="0" max="80" v-model.number="secantLat" @input="onParamsUpdate" />
+          <input type="number" class="value-input" v-model.number="secantLat" @change="onParamsUpdate" />
           <span class="unit">°</span>
         </div>
 
@@ -51,19 +54,24 @@ const props = defineProps({
   globeRotation: {
     type: Object,
     default: () => ({ lon: 0, lat: 0 })
+  },
+  projectionType: {
+    type: String,
+    default: 'cylinder'
   }
 });
 
-const emit = defineEmits(['update:rotation']);
+const emit = defineEmits(['update:rotation', 'update:params']);
 
 const centerMeridian = ref(0);
 const centerLatitude = ref(0);
-const roll = ref(0);
 const scale = ref(150);
+
+const currentVariant = ref('conformal');
+const secantLat = ref(0);
 
 let isInternalChange = false;
 
-// Listen to Earth 3D changing
 watch(() => props.globeRotation, (newVal) => {
   if (!isInternalChange) {
     centerMeridian.value = Math.round(newVal.lon);
@@ -72,7 +80,10 @@ watch(() => props.globeRotation, (newVal) => {
   }
 }, { deep: true });
 
-// Trigger changes back to Earth 3D
+watch(() => props.projectionType, () => {
+  updateLocalMap();
+});
+
 const onManualUpdate = () => {
   isInternalChange = true;
   updateLocalMap();
@@ -80,8 +91,24 @@ const onManualUpdate = () => {
   setTimeout(() => { isInternalChange = false; }, 100);
 };
 
+const onParamsUpdate = () => {
+  updateLocalMap();
+  emit('update:params', { variant: currentVariant.value, secantLat: secantLat.value });
+};
+
+const setVariant = (variant) => {
+  currentVariant.value = variant;
+  
+  if (props.projectionType === 'cylinder') {
+    secantLat.value = (variant === 'conformal') ? 0 : 30;
+  } else if (props.projectionType === 'azimuthal') {
+    secantLat.value = (variant === 'conformal') ? 0 : 30;
+  }
+  
+  onParamsUpdate();
+};
+
 const svgRef = ref(null);
-const wrapperRef = ref(null);
 let geoData = null;
 
 const loadData = async () => {
@@ -89,6 +116,12 @@ const loadData = async () => {
   const data = await res.json();
   geoData = topojson.feature(data, data.objects.land);
   updateLocalMap();
+};
+
+// Custom projection formulas
+const cylindricalEqualAreaRaw = (lambda, phi) => {
+  const cosSec = Math.cos(secantLat.value * Math.PI / 180);
+  return [lambda * cosSec, Math.sin(phi) / cosSec];
 };
 
 const updateLocalMap = () => {
@@ -103,10 +136,27 @@ const updateLocalMap = () => {
   svg.append('rect')
     .attr('width', width)
     .attr('height', height)
-    .attr('fill', '#f0f7ff');
+    .attr('fill', '#f4f6f8');
 
-  const projection = d3.geoMercator()
-    .rotate([-centerMeridian.value, -centerLatitude.value, roll.value])
+  let projection;
+
+  if (props.projectionType === 'cylinder') {
+    if (currentVariant.value === 'conformal') {
+      projection = d3.geoMercator();
+    } else {
+      projection = d3.geoProjection(cylindricalEqualAreaRaw);
+    }
+  } else if (props.projectionType === 'azimuthal') {
+    if (currentVariant.value === 'conformal') {
+      projection = d3.geoStereographic();
+    } else {
+      projection = d3.geoAzimuthalEqualArea();
+    }
+  } else {
+    projection = d3.geoMercator();
+  }
+
+  projection.rotate([-centerMeridian.value, -centerLatitude.value, 0])
     .translate([width / 2, height / 2])
     .scale(scale.value);
 
@@ -117,9 +167,9 @@ const updateLocalMap = () => {
     .data(geoData.features)
     .join('path')
     .attr('d', pathGenerator)
-    .attr('fill', '#fdfbf7')
-    .attr('stroke', '#1e293b')
-    .attr('stroke-width', 1.2);
+    .attr('fill', '#ffffff')
+    .attr('stroke', '#333333')
+    .attr('stroke-width', 1.0);
 
   const graticule = d3.geoGraticule();
   svg.append('path')
@@ -127,9 +177,44 @@ const updateLocalMap = () => {
     .attr('class', 'graticule')
     .attr('d', pathGenerator)
     .attr('fill', 'none')
-    .attr('stroke', '#94a3b8')
-    .attr('stroke-width', 0.6)
-    .attr('stroke-dasharray', '4,4');
+    .attr('stroke', '#ccc')
+    .attr('stroke-width', 0.5);
+
+  // Draw secant / standard parallels in red
+  if (props.projectionType === 'cylinder' || props.projectionType === 'azimuthal') {
+    const lats = [secantLat.value, -secantLat.value];
+    const secantLines = {
+      type: "FeatureCollection",
+      features: lats.map(lat => ({
+        type: "Feature",
+        geometry: {
+          type: "LineString",
+          coordinates: d3.range(-180, 181, 2).map(lon => [lon, lat])
+        }
+      }))
+    };
+
+    // For azimuthal, secant is a circle distance. D3 doesn't have native "secant azimuthal".
+    // We just highlight the standard parallel based on distance from center.
+    // In azimuthal, standard lat usually refers to distance from center. Let's just draw the radius circle.
+    if (props.projectionType === 'azimuthal') {
+       // Just draw a circle around center
+       const circle = d3.geoCircle().center([centerMeridian.value, centerLatitude.value]).radius(90 - secantLat.value)();
+       svg.append('path')
+        .datum(circle)
+        .attr('d', pathGenerator)
+        .attr('fill', 'none')
+        .attr('stroke', '#d92d20')
+        .attr('stroke-width', 2.0);
+    } else {
+       svg.append('path')
+        .datum(secantLines)
+        .attr('d', pathGenerator)
+        .attr('fill', 'none')
+        .attr('stroke', '#d92d20')
+        .attr('stroke-width', 2.0);
+    }
+  }
 };
 
 onMounted(() => {
@@ -147,101 +232,87 @@ onMounted(() => {
 }
 
 .controls-panel {
-  background: linear-gradient(to right, #1e293b, #334155);
-  color: white;
-  padding: 25px 40px;
-  border-bottom: 3px solid #e2e8f0;
+  background: #fbfbfb;
+  color: #333;
+  padding: 20px 30px;
+  border-bottom: 1px solid #eee;
 }
 
 .panel-header {
   display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 25px;
+  margin-bottom: 20px;
 }
 
 .panel-header h3 {
-  margin: 0; font-size: 1.8rem; font-weight: 700; color: #f8fafc;
-  letter-spacing: 1px;
+  margin: 0; font-size: 1.4rem; font-weight: 600; color: #222;
 }
 
-.badge {
-  background: #10b981; color: white;
-  padding: 6px 14px; border-radius: 20px;
-  font-size: 1.2rem; font-weight: bold;
-  letter-spacing: 0.5px;
-  box-shadow: 0 2px 6px rgba(16,185,129,0.4);
+.header-actions {
+  display: flex; gap: 10px;
+}
+
+.toggle-btn {
+  background: white; border: 1px solid #ccc; color: #555;
+  padding: 6px 16px; border-radius: 4px; cursor: pointer;
+  font-size: 1rem; font-weight: 500; transition: all 0.2s;
+}
+
+.toggle-btn.active {
+  background: #111; color: white; border-color: #111;
 }
 
 .sliders-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 30px 60px;
+  gap: 20px 40px;
 }
 
 .param-item {
   display: flex;
   align-items: center;
-  background: rgba(0,0,0,0.25);
-  padding: 15px 20px;
-  border-radius: 10px;
-  border: 1px solid rgba(255,255,255,0.05);
+  background: #ffffff;
+  padding: 12px 16px;
+  border-radius: 6px;
+  border: 1px solid #eaeaea;
 }
 
 .param-item label {
-  width: 160px;
-  font-size: 1.4rem;
-  color: #cbd5e1;
-  font-weight: 600;
+  width: 140px;
+  font-size: 1.05rem;
+  color: #555;
+  font-weight: 500;
 }
 
 .param-item input[type="range"] {
   flex: 1;
-  margin: 0 20px;
-  accent-color: #3b82f6; 
-  height: 6px;
+  margin: 0 15px;
+  accent-color: #333; 
+  height: 4px;
 }
 
-/* Clickable input styling */
 .value-input {
-  width: 70px;
-  background: rgba(255,255,255,0.1);
-  border: 1px solid rgba(255,255,255,0.3);
-  border-radius: 6px;
-  color: #6ee7b7;
-  font-family: 'Courier New', Courier, monospace;
-  font-weight: bold;
-  font-size: 1.5rem;
-  padding: 6px 4px;
+  width: 60px;
+  background: #f9f9f9;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  color: #111;
+  font-family: monospace;
+  font-size: 1.1rem;
+  padding: 4px;
   text-align: center;
   outline: none;
-  transition: all 0.3s;
 }
-.value-input.scale-i { width: 85px; }
+.value-input.scale-i { width: 70px; }
 
-.value-input:focus {
-  background: rgba(255,255,255,0.2);
-  border-color: #6ee7b7;
-  box-shadow: 0 0 8px rgba(110,231,183,0.5);
-}
+.value-input:focus { border-color: #999; }
 
-/* Hide arrows for number inputs */
 input[type=number]::-webkit-inner-spin-button, 
-input[type=number]::-webkit-outer-spin-button { 
-  -webkit-appearance: none; 
-  margin: 0; 
-}
+input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 input[type=number] { -moz-appearance: textfield; }
 
 .unit {
-  font-size: 1.4rem;
-  color: #94a3b8;
-  margin-left: 6px;
-  font-weight: bold;
+  font-size: 1.1rem; color: #888; margin-left: 6px;
 }
 
-.svg-wrapper {
-  background: #ffffff;
-  flex: 1;
-  display: flex;
-  min-height: 600px;
-}
+.svg-wrapper { background: #f4f6f8; flex: 1; display: flex; min-height: 600px; }
 </style>
