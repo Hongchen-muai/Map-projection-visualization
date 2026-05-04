@@ -84,14 +84,28 @@ export function updateProjectionMode(type, variant, secantLat) {
 
   if (type === 'cylinder') {
     R_CYLINDER = R_EARTH * Math.cos(secantLat * Math.PI / 180);
+  } else if (type === 'conic') {
+    R_CYLINDER = R_EARTH * Math.cos(secantLat * Math.PI / 180);
   } else {
-    R_CYLINDER = R_EARTH; // For azimuthal scale reference
+    R_CYLINDER = R_EARTH; 
   }
 
   if (glassCylinder) {
     glassCylinder.geometry.dispose();
     if (type === 'cylinder') {
       glassCylinder.geometry = new THREE.CylinderGeometry(R_CYLINDER * 1.01, R_CYLINDER * 1.01, 30, 64, 1, true);
+    } else if (type === 'conic') {
+      const phi0 = Math.max(0.1, Math.abs(secantLat)) * Math.PI / 180;
+      const R_OUTER = R_EARTH * 1.01;
+      const y_vertex = R_OUTER / Math.sin(phi0);
+      const y_base = -R_OUTER; 
+      const h = y_vertex - y_base;
+      const r = h * Math.tan(phi0);
+      
+      glassCylinder.geometry = new THREE.ConeGeometry(r, h, 64, 1, true);
+      const yOffset = secantLat >= 0 ? (y_base + h / 2) : -(y_base + h / 2);
+      glassCylinder.geometry.translate(0, yOffset, 0);
+      if (secantLat < 0) glassCylinder.geometry.rotateX(Math.PI);
     } else {
       let geo = new THREE.PlaneGeometry(30, 30, 8, 8);
       geo.rotateX(-Math.PI / 2);
@@ -122,50 +136,86 @@ function clearGeometry() {
   // No longer destroying glassCylinder here, so we can update it dynamically
 }
 
-const createUnfoldMaterial = (colorHex, isInvariant = false) => {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uProject: { value: 0.0 },                     
-      uUnfold: { value: 0.0 },                      
-      uColor: { value: new THREE.Color(colorHex) }, 
-      uOpacity: { value: 0.0 }                      
-    },
-    vertexShader: `
-      uniform float uProject;
-      uniform float uUnfold;
-      attribute vec3 spherePos;
-      
-      void main() {
-        vec3 cylPos = position;
-        vec3 flatPos;
+  const createUnfoldMaterial = (colorHex, isInvariant = false) => {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        uProject: { value: 0.0 },                     
+        uUnfold: { value: 0.0 },                      
+        uColor: { value: new THREE.Color(colorHex) }, 
+        uOpacity: { value: 0.0 }                      
+      },
+      vertexShader: `
+        uniform float uProject;
+        uniform float uUnfold;
+        attribute vec3 spherePos;
+        varying float vAlphaFactor;
         
-        ${currentProjType === 'cylinder' ? `
-          float angle = atan(cylPos.x, cylPos.z);
-          float flatX = angle * ${R_CYLINDER.toFixed(2)};
-          flatPos = vec3(flatX, cylPos.y, 0.0);
-        ` : `
-          // Azimuthal unfolds to itself (plane -> plane)
-          flatPos = vec3(cylPos.x, cylPos.z, 0.0);
-        `}
-        
-        vec3 stage1Pos = mix(spherePos, cylPos, uProject);
-        vec3 finalPos = mix(stage1Pos, flatPos, uUnfold);
-        
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(finalPos, 1.0);
-      }
-    `,
-    fragmentShader: `
-      uniform vec3 uColor;
-      uniform float uOpacity;
-      void main() {
-        gl_FragColor = vec4(uColor, uOpacity);
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    linewidth: isInvariant ? 2 : 1
-  });
-};
+        void main() {
+          vec3 cylPos = position;
+          vec3 flatPos;
+          
+          ${currentProjType === 'cylinder' ? `
+            float angle = atan(cylPos.x, cylPos.z);
+            float flatX = angle * ${R_CYLINDER.toFixed(2)};
+            flatPos = vec3(flatX, cylPos.y, 0.0);
+          ` : currentProjType === 'conic' ? `
+            float n = sin(${Math.max(0.1, Math.abs(currentSecantLat)) * Math.PI / 180});
+            float r_cone = length(vec2(cylPos.x, cylPos.z));
+            float rho = r_cone / n;
+            float theta = atan(cylPos.x, cylPos.z) * n;
+            // Shift the apex up so the map is somewhat centered
+            float y_shift = ${R_EARTH.toFixed(2)} / n;
+            flatPos = vec3(rho * sin(theta), y_shift - rho * cos(theta), 0.0);
+          ` : `
+            flatPos = vec3(cylPos.x, cylPos.z, 0.0);
+          `}
+          
+          vec3 stage1Pos = mix(spherePos, cylPos, uProject);
+          vec3 finalPos = mix(stage1Pos, flatPos, uUnfold);
+          
+          // Calculate normal for edge fading based on projection shape
+          vec3 normalDir;
+          ${currentProjType === 'cylinder' ? `
+            normalDir = normalize(vec3(cylPos.x, 0.0, cylPos.z));
+          ` : currentProjType === 'conic' ? `
+            normalDir = normalize(vec3(cylPos.x, 0.0, cylPos.z)); // Edge fade uses horizontal plane
+          ` : `
+            normalDir = vec3(0.0, 1.0, 0.0);
+          `}
+          
+          // Only apply edge fading in 3D (uProject > 0.0, uUnfold < 1.0)
+          vec3 viewDir = normalize(cameraPosition - (modelMatrix * vec4(stage1Pos, 1.0)).xyz);
+          vec3 worldNormal = normalize((modelMatrix * vec4(normalDir, 0.0)).xyz);
+          float dotView = dot(worldNormal, viewDir);
+          
+          // Map dot product from [-0.1, 0.2] to [0.0, 1.0] for smooth edge fade
+          float edgeAlpha = smoothstep(-0.1, 0.2, dotView);
+          
+          // When uProject is 0 (on sphere), use sphere normal for fading
+          vec3 sphereNormal = normalize((modelMatrix * vec4(spherePos, 0.0)).xyz);
+          float sphereDot = dot(sphereNormal, viewDir);
+          float sphereAlpha = smoothstep(-0.1, 0.2, sphereDot);
+          
+          float currentAlpha = mix(sphereAlpha, edgeAlpha, uProject);
+          vAlphaFactor = mix(currentAlpha, 1.0, uUnfold);
+          
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(finalPos, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 uColor;
+        uniform float uOpacity;
+        varying float vAlphaFactor;
+        void main() {
+          gl_FragColor = vec4(uColor, uOpacity * vAlphaFactor);
+        }
+      `,
+      transparent: true,
+      depthTest: false, // Turn off depth test to prevent Z-fighting with Earth
+      depthWrite: false,
+      linewidth: isInvariant ? 2 : 1
+    });
+  };
 
 export function initScene(container) {
   scene = new THREE.Scene();
@@ -265,7 +315,33 @@ function lonLatToMercatorCylinder(lon, lat, R) {
   return new THREE.Vector3(R * Math.sin(lambda), y, R * Math.cos(lambda));
 }
 
-function lonLatToAzimuthal(lon, lat, R) {
+function lonLatToConic(lon, lat, R) {
+  const lambda = lon * (Math.PI / 180);
+  const phi = lat * (Math.PI / 180);
+  const phi0 = Math.max(0.1, Math.abs(currentSecantLat)) * (Math.PI / 180);
+  const n = Math.sin(phi0);
+  const F = Math.cos(phi0) * Math.pow(Math.tan(Math.PI/4 + phi0/2), n) / n;
+  
+  let rho;
+  if (currentVariant === 'conformal') {
+    const clampedLat = Math.max(-85, Math.min(85, lat));
+    const clampedPhi = clampedLat * (Math.PI / 180);
+    rho = R * F / Math.pow(Math.tan(Math.PI/4 + clampedPhi/2), n);
+  } else {
+    const C = Math.pow(Math.cos(phi0), 2) + 2 * n * Math.sin(phi0);
+    rho = R * Math.sqrt(C - 2 * n * Math.sin(phi)) / n;
+  }
+  
+  const theta = n * lambda;
+  // Position on cone:
+  // r_cone = rho * sin(phi0)
+  // y_cone = rho * cos(phi0)
+  const r_cone = rho * Math.sin(phi0);
+  const y_cone = R / Math.sin(phi0) - rho * Math.cos(phi0);
+  
+  return new THREE.Vector3(r_cone * Math.sin(theta), currentSecantLat >= 0 ? y_cone : -y_cone, r_cone * Math.cos(theta));
+}
+function lonLatToPlane(lon, lat, R) {
   // Simple tangent plane at North Pole for visual representation of planar projection
   const lambda = lon * (Math.PI / 180);
   const phi = lat * (Math.PI / 180);
@@ -325,7 +401,12 @@ function drawGraticule() {
     for (let rawLon = -180; rawLon <= 180; rawLon += 5) {
       const { lon: rotatedLon, lat: rotatedLat } = rotateLonLat(rawLon, lat);
       spherePts.push(lonLatToSphere(rotatedLon, rotatedLat, R_EARTH));
-      cylPts.push(currentProjType === 'cylinder' ? lonLatToMercatorCylinder(rotatedLon, rotatedLat, R_CYLINDER) : lonLatToAzimuthal(rotatedLon, rotatedLat, R_EARTH));
+      
+      let targetP;
+      if (currentProjType === 'cylinder') targetP = lonLatToMercatorCylinder(rotatedLon, rotatedLat, R_CYLINDER);
+      else if (currentProjType === 'conic') targetP = lonLatToConic(rotatedLon, rotatedLat, R_EARTH);
+      else targetP = lonLatToPlane(rotatedLon, rotatedLat, R_EARTH);
+      cylPts.push(targetP);
     }
     addGraticuleLine(spherePts, cylPts);
   }
@@ -336,7 +417,12 @@ function drawGraticule() {
     for (let rawLat = -80; rawLat <= 80; rawLat += 5) {
       const { lon: rotatedLon, lat: rotatedLat } = rotateLonLat(lon, rawLat);
       spherePts.push(lonLatToSphere(rotatedLon, rotatedLat, R_EARTH));
-      cylPts.push(currentProjType === 'cylinder' ? lonLatToMercatorCylinder(rotatedLon, rotatedLat, R_CYLINDER) : lonLatToAzimuthal(rotatedLon, rotatedLat, R_EARTH));
+      
+      let targetP;
+      if (currentProjType === 'cylinder') targetP = lonLatToMercatorCylinder(rotatedLon, rotatedLat, R_CYLINDER);
+      else if (currentProjType === 'conic') targetP = lonLatToConic(rotatedLon, rotatedLat, R_EARTH);
+      else targetP = lonLatToPlane(rotatedLon, rotatedLat, R_EARTH);
+      cylPts.push(targetP);
     }
     addGraticuleLine(spherePts, cylPts);
   }
@@ -366,17 +452,14 @@ function drawInvariantLine(lat) {
   let spherePts = [];
   let cylPts = [];
   for (let rawLon = -180; rawLon <= 180; rawLon += 5) {
-    // Invariant line should be fixed relative to projection, NOT earth!
-    // So we don't rotate its lat, lon! It's defined on the projection cylinder!
     const lon = rawLon;
-    // Wait, the invariant line is part of the cylinder. Does it match the earth's invariant line?
-    // The invariant line on Earth must rotate WITH the earth? No!
-    // The invariant line is standard parallel. It's fixed relative to the projection.
-    // So its geographic coordinates on the earth ARE rotated?
-    // Actually, we want the invariant line to just be the circle where cylinder meets earth.
-    // So we just use `rawLon, lat` directly! Because `lonLatToSphere(rawLon, lat)` is already on the projection axis!
     spherePts.push(lonLatToSphere(lon, lat, R_EARTH));
-    cylPts.push(currentProjType === 'cylinder' ? lonLatToMercatorCylinder(lon, lat, R_CYLINDER) : lonLatToAzimuthal(lon, lat, R_EARTH));
+    
+    let targetP;
+    if (currentProjType === 'cylinder') targetP = lonLatToMercatorCylinder(lon, lat, R_CYLINDER);
+    else if (currentProjType === 'conic') targetP = lonLatToConic(lon, lat, R_EARTH);
+    else targetP = lonLatToPlane(lon, lat, R_EARTH);
+    cylPts.push(targetP);
   }
   
   const cylGeo = new THREE.BufferGeometry().setFromPoints(cylPts);
@@ -411,7 +494,7 @@ function drawRegion(coordinates) {
       });
       cylinderGeo.setAttribute('spherePos', new THREE.BufferAttribute(sphereCoords, 3));
 
-      const cylMat = createUnfoldMaterial(0x2563eb); 
+      const cylMat = createUnfoldMaterial(0x475569); 
       const cylLine = new THREE.Line(cylinderGeo, cylMat);
       cylLine.visible = false; 
       cylLine.frustumCulled = false; // FINALLY FIXED RENDER CROPPING IN STEP 2
@@ -419,13 +502,25 @@ function drawRegion(coordinates) {
 
       for (let i = 0; i < spherePoints.length; i += 15) {
         const cylP = cylinderPoints[i];
-        const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), cylP]);
+        const sphP = spherePoints[i];
+        
+        let rayStart = new THREE.Vector3(0, 0, 0);
+        if (currentProjType === 'cylinder' && currentVariant !== 'conformal') {
+          rayStart.set(0, sphP.y, 0); 
+        }
+
+        const localCylP = cylP.clone().sub(rayStart);
+        const localSphP = sphP.clone().sub(rayStart);
+
+        const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), localCylP]);
         const rayMat = new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0 });
         const rayLine = new THREE.Line(rayGeo, rayMat);
+        rayLine.position.copy(rayStart);
         
-        const initScale = R_EARTH / cylP.length();
+        const initScale = localCylP.length() > 0.01 ? localSphP.length() / localCylP.length() : 1.0;
         rayLine.scale.set(initScale, initScale, initScale);
         rayLine.userData = { initScale: initScale };
+        
         rayLine.frustumCulled = false;
         raysGroup.add(rayLine);
       }
@@ -438,23 +533,119 @@ function drawRegion(coordinates) {
   coordinates[0].forEach(coord => {
     const rawLon = coord[0];
     const rawLat = coord[1];
-    const { lon, lat } = rotateLonLat(rawLon, rawLat);
     
-    if (prevLon !== null && Math.abs(lon - prevLon) > 90) flushLines();
+    // Apply oblique rotation if needed
+    const rotated = rotateLonLat(rawLon, rawLat);
+    const lon = rotated.lon;
+    const lat = rotated.lat;
+
+    const p = lonLatToSphere(lon, lat, R_EARTH);
+    
+    // For rendering continuous lines across the antimeridian, we just skip drawing if distance is too large
+    if (prevLon !== null && Math.abs(lon - prevLon) > 100) {
+      flushLines();
+    }
     prevLon = lon;
-    spherePoints.push(lonLatToSphere(lon, lat, R_EARTH));
-    cylinderPoints.push(currentProjType === 'cylinder' ? lonLatToMercatorCylinder(lon, lat, R_CYLINDER) : lonLatToAzimuthal(lon, lat, R_EARTH));
+
+    spherePoints.push(p);
+    
+    let targetP;
+    if (currentProjType === 'cylinder') targetP = lonLatToMercatorCylinder(lon, lat, R_CYLINDER);
+    else if (currentProjType === 'conic') targetP = lonLatToConic(lon, lat, R_EARTH);
+    else targetP = lonLatToPlane(lon, lat, R_EARTH);
+    cylinderPoints.push(targetP);
   });
   flushLines();
 }
 
 // MAKE STEPS REPEATABLE AND REVERSIBLE
+let lightSourceGroup = null;
+
+function createLightSourceMarkers() {
+  if (lightSourceGroup) {
+    scene.remove(lightSourceGroup);
+    lightSourceGroup = null;
+  }
+  
+  lightSourceGroup = new THREE.Group();
+  scene.add(lightSourceGroup);
+  
+  // Point light source marker (for conic/conformal variants - from sphere center)
+  if (currentProjType === 'conic' || currentVariant === 'conformal') {
+    const pointGeo = new THREE.SphereGeometry(0.15, 16, 16);
+    const pointMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const pointMesh = new THREE.Mesh(pointGeo, pointMat);
+    
+    if (currentProjType === 'cylinder') {
+      // For cylinder, point source is at center of sphere
+      pointMesh.position.set(0, 0, 0);
+    } else if (currentProjType === 'conic') {
+      // For conic, point source is at the cone apex
+      const phi0 = Math.max(0.1, Math.abs(currentSecantLat)) * Math.PI / 180;
+      const y_vertex = R_EARTH / Math.sin(phi0);
+      pointMesh.position.set(0, currentSecantLat >= 0 ? y_vertex : -y_vertex, 0);
+    } else if (currentProjType === 'azimuthal') {
+      // For azimuthal, point source is at antipodal point
+      const planeZ = R_EARTH * Math.sin(currentSecantLat * Math.PI / 180);
+      pointMesh.position.set(0, -planeZ, 0);
+    }
+    lightSourceGroup.add(pointMesh);
+  } else if (currentProjType === 'cylinder' && currentVariant === 'equalArea') {
+    // Line light source - create a vertical line along Y axis
+    const lineGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, -15, 0),
+      new THREE.Vector3(0, 15, 0)
+    ]);
+    const lineMat = new THREE.LineDashedMaterial({ 
+      color: 0x000000, 
+      dashSize: 0.5, 
+      gapSize: 0.3 
+    });
+    lineMat.computeLineDistances();
+    const lineMesh = new THREE.Line(lineGeo, lineMat);
+    lightSourceGroup.add(lineMesh);
+    
+    // Add small spheres to show it's a "bar" of light
+    const smallSphereGeo = new THREE.SphereGeometry(0.08, 8, 8);
+    const smallSphereMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    [-10, 0, 10].forEach(y => {
+      const dot = new THREE.Mesh(smallSphereGeo, smallSphereMat);
+      dot.position.set(0, y, 0);
+      lightSourceGroup.add(dot);
+    });
+  } else if (currentProjType === 'azimuthal' && currentVariant === 'equalArea') {
+    // For azimuthal equal-area, it's a mathematical projection (not a simple point)
+    // Draw a horizontal circle to represent equal-area property
+    const ringGeo = new THREE.RingGeometry(0.3, 0.35, 32);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.rotation.x = Math.PI / 2;
+    const planeZ = R_EARTH * Math.sin(currentSecantLat * Math.PI / 180);
+    ring.position.set(0, -planeZ, 0);
+    lightSourceGroup.add(ring);
+  }
+}
+
 export function step1_wrapCylinder() {
   currentAnimStep = 1;
+  createLightSourceMarkers();
+  
   if (!glassCylinder) {
     let geometry;
     if (currentProjType === 'cylinder') {
       geometry = new THREE.CylinderGeometry(R_CYLINDER * 1.01, R_CYLINDER * 1.01, 30, 64, 1, true);
+    } else if (currentProjType === 'conic') {
+      const phi0 = Math.max(0.1, Math.abs(currentSecantLat)) * Math.PI / 180;
+      const R_OUTER = R_EARTH * 1.01;
+      const y_vertex = R_OUTER / Math.sin(phi0);
+      const y_base = -R_OUTER; 
+      const h = y_vertex - y_base;
+      const r = h * Math.tan(phi0);
+      
+      geometry = new THREE.ConeGeometry(r, h, 64, 1, true);
+      const yOffset = currentSecantLat >= 0 ? (y_base + h / 2) : -(y_base + h / 2);
+      geometry.translate(0, yOffset, 0);
+      if (currentSecantLat < 0) geometry.rotateX(Math.PI);
     } else {
       // Plane
       geometry = new THREE.PlaneGeometry(30, 30, 8, 8);
